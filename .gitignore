@@ -1,11 +1,1 @@
 .env
-backend/.env
-backend/.venv/
-__pycache__/
-.pytest_cache/
-*.py[cod]
-backend/vector_store/
-backend/data/conversations.sqlite3*
-frontend/node_modules/
-frontend/dist/
-.ipynb_checkpoints

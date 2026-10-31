@@ -1,1 +1,1 @@
-"""Backend application services."""
+"""Application services."""

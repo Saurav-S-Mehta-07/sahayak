@@ -1,1 +1,1 @@
-"""FastAPI application package."""
+"""Yojana Sahayak backend application."""

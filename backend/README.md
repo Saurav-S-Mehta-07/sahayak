@@ -1,60 +1,207 @@
 # Yojana Sahayak backend
 
-The backend contains the existing modular RAG pipeline, FastAPI adapter, source PDFs, and persisted Chroma database. Its runtime paths are resolved relative to this directory by `src/config.py`, independent of the current working directory.
+A FastAPI service that answers questions from indexed government-scheme PDFs, keeps
+session-isolated conversation state, and returns page-level citations. The original
+`RAG_pipeline.ipynb` remains unchanged by this backend.
 
-## Setup
+## What was reused
 
-From the project root:
+The notebook uses `PyPDFLoader`, `RecursiveCharacterTextSplitter` at 500 characters
+with 50-character overlap, SentenceTransformers `all-MiniLM-L6-v2` (384 dimensions),
+Chroma's persistent `pdf_documents` collection, top-5 vector retrieval, and Groq
+`qwen/qwen3-32b` at temperature 0.1. The backend preserves those defaults and the
+collection name, but uses deterministic chunk IDs, first-class page metadata,
+normalized vectors, incremental indexing, explicit prompts, and separate services.
+The notebook refers to `API_KEY_GROQ`; the backend correctly reads `GROQ_API_KEY`
+from the project-root `.env`.
 
-```powershell
-Copy-Item backend\.env.example backend\.env
-# Set GROQ_API_KEY in backend\.env
-python -m pip install -r backend\requirements.txt
+The previous vector-store files and other tracked files are currently absent from the
+worktree. The backend does not restore them or modify the notebook.
+
+## Architecture
+
+```text
+backend/
+  app/
+    api/routes/       FastAPI chat, schemes, eligibility, documents, sessions, health
+    core/             Configuration, logging, errors, constants
+    models/           Validated request/response schemas
+    rag/              PDF parsing, cleaning, chunking, embeddings, Chroma, retrieval,
+                      citations, context building, incremental ingestion
+    services/         Chat, Groq, memory, eligibility, schemes, documents, grounding
+    utils/            Language detection and safe text helpers
+  data/
+    pdfs/             The only supported PDF input directory
+    processed/        SQLite session/ingestion metadata
+    vector_store/     Persistent Chroma database
+  scripts/            Ingestion, index rebuild, retrieval smoke test
+  tests/
 ```
 
-The `.env.example` contains placeholders only. `GROQ_API_KEY` is required for model responses. `CORS_ORIGINS` is a comma-separated list of allowed browser origins; it defaults to the local Vite origins.
+Runtime vector state stays under `backend/data/`; PDF ingestion never accepts
+user-supplied paths. When `MONGODB_URI` is set, MongoDB stores session and document
+metadata; otherwise SQLite stores both in `backend/data/processed/`. Files in the
+project-root `.env` are loaded without printing or copying their values.
 
-Optional scheme discovery is disabled by default. Configure permitted government RSS/Atom feed URLs with comma-separated `SCHEME_DISCOVERY_FEEDS`; set `SCHEME_DISCOVERY_INTERVAL_HOURS` above zero for periodic polling. The service only records official-domain feed links as unverified admin review signals and never indexes feed content.
+## Install and configure
 
-## Start the API
-
-From the project root:
-
-```powershell
-python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-Or from this `backend` directory:
+Python 3.10+ is recommended.
 
 ```powershell
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-The API is available at `http://127.0.0.1:8000`. Health and interactive API documentation are at `/api/health` and `/docs`.
+Keep the actual `.env` at the repository root. Start from `backend/.env.example` and
+add only variable names and values you need to that existing root file:
 
-## API endpoints
+| Variable | Default | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | unset | Required for generated answers; never returned or logged |
+| `GROQ_MODEL` | `qwen/qwen3-32b` | Configurable Groq model |
+| `GROQ_TEMPERATURE` | `0.1` | Answer generation temperature |
+| `GROQ_MAX_TOKENS` | `1024` | Maximum answer tokens |
+| `GROQ_TIMEOUT_SECONDS` | `30` | Request timeout |
+| `GROQ_RETRIES` | `2` | Retries for transient API errors |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | SentenceTransformers model |
+| `RETRIEVAL_TOP_K` | `5` | Passage count before deduplication |
+| `RETRIEVAL_MIN_SIMILARITY` | `0.5` | Cosine threshold; provisional smoke calibration, tune against your indexed corpus |
+| `MAX_REQUEST_CHARACTERS` | `4000` | Chat request size limit |
+| `MAX_CONTEXT_CHARACTERS` | `14000` | Combined prompt/context budget |
+| `MAX_RECENT_MESSAGES` | `12` | Recent messages retained for the prompt |
+| `INGESTION_API_KEY` | unset | Enables the protected HTTP ingestion endpoint |
+| `CORS_ORIGINS` | `http://localhost:5173` | Allowed frontend origins |
+| `LOG_LEVEL` | `INFO` | Application log level |
+| `HF_TOKEN` | unset | Optional Hugging Face access token for model downloads |
+| `MONGODB_URI` | unset | Optional MongoDB storage for sessions and ingestion metadata |
+| `MONGODB_USERNAME`, `MONGODB_PASSWORD` | unset | Optional credentials if not embedded in the URI |
+| `MONGODB_DATABASE` | URI database or `yojana_sahayak` | Optional MongoDB database name |
 
-- `GET /api/health`: reports backend and persisted vector-store availability.
-- `GET /api/documents`: lists PDF files represented in Chroma metadata.
-- `POST /api/chat`: accepts `{"query": "...", "conversation_id": "optional"}` and returns the model answer and actual retrieved source passages.
+Do not commit the root `.env`. No API key is needed for document ingestion or
+retrieval-only smoke tests.
 
-## Preserved RAG configuration
+## Add PDFs and ingest
 
-The existing pipeline and persisted Chroma collection are reused. The embedding model, 500-character chunks with 50-character overlap, retrieval configuration, Groq model and prompt, SQLite conversation memory, and explicit ingestion/query separation are unchanged. The existing vector database is at `vector_store/`; PDFs are at `data/pdfs/`; conversation history is at `data/conversations.sqlite3`.
-
-API startup and user queries do not ingest PDFs or regenerate their embeddings. Ingestion remains an explicit operation, run only when intended:
+Put all government scheme PDFs only in `backend/data/pdfs/`. The current worktree
+contains one PDF, which is moved into that directory as part of this backend setup.
+Scanned/image-only files are reported as failed because OCR is not configured.
 
 ```powershell
-Set-Location backend
-python -c "from src.rag_pipeline import RAGPipeline; print(RAGPipeline().ingest())"
+python scripts/ingest_documents.py
 ```
 
-## Tests
-
-From the project root:
+The command reports discovered, processed, failed, duplicate, updated, unchanged,
+deleted documents, pages, chunks, and newly generated embeddings. Re-running it skips
+unchanged checksums and reuses unchanged chunk vectors for modified files. Deleted
+PDFs have their vectors and ingestion metadata removed. To intentionally rebuild the
+index after changing `EMBEDDING_MODEL`:
 
 ```powershell
-python -m pytest backend\tests
+python scripts/rebuild_index.py
 ```
 
-Tests use the persisted local PDFs and vector store for path, loader, health, and document-list checks; model behavior in unit tests is isolated with fakes.
+Never point the new model at vectors generated by a different embedding model.
+
+## Run
+
+```powershell
+python run.py
+```
+
+The service listens on `http://localhost:8000`; OpenAPI documentation is available
+at `/docs`. It does not re-ingest PDFs during normal requests.
+
+## API
+
+All application endpoints use `/api/v1`:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/chat` | Grounded multilingual chat; `session_id` is optional |
+| `GET` | `/schemes` | List indexed schemes |
+| `GET` | `/schemes/{scheme_id}` | Get an indexed scheme |
+| `GET` | `/schemes/search?q=...` | Search scheme/document names |
+| `POST` | `/eligibility/evaluate` | Conservative document-backed preliminary evaluation |
+| `GET` | `/documents` | List indexed PDFs |
+| `GET` | `/documents/{document_id}` | Get document metadata |
+| `GET` | `/documents/{document_id}/file#page=12` | Open the source PDF at the cited page |
+| `POST` | `/documents/ingest` | Run local-directory ingestion; requires `X-Ingestion-Key` |
+| `GET` | `/documents/ingestion-status` | Current indexed-document status |
+| `POST` | `/sessions` | Create a session |
+| `GET` | `/sessions/{session_id}/history` | Read session history |
+| `DELETE` | `/sessions/{session_id}` | Delete one session and its messages |
+| `GET` | `/health` and `/api/v1/health` | Liveness and component status |
+
+Example:
+
+```json
+{
+  "session_id": null,
+  "message": "PM Kisan ke liye eligibility kya hai?",
+  "language": "auto"
+}
+```
+
+The chat response includes a detected language, citation objects (document ID, title,
+page, excerpt, and PDF URL), a grounding status, suggested questions, and current
+scheme context. API errors use a JSON `detail` field. Session IDs are unguessable
+bearer identifiers; do not share them. Authentication/account ownership is not
+implemented in this hackathon backend.
+
+## Grounding, citations, and memory
+
+Citation IDs are assigned by the backend to retrieved chunks, not generated from LLM
+metadata. The prompt requires inline `[CIT-001]` markers. Returned citations are
+restricted to those retrieved chunk IDs and retain actual one-based PDF page numbers.
+Deterministic checks reject missing/unknown citations and unsupported numeric values.
+These checks do not prove semantic entailment for every non-numeric statement; treat
+the grounding result as a best-effort guard, not a formal guarantee.
+
+When MongoDB is configured, it stores sessions and ingestion metadata; without it,
+SQLite stores these in `backend/data/processed/sahayak.sqlite3`. Conversation state
+keeps recent turns, a bounded rolling text summary, current scheme, language, and
+explicitly volunteered profile fields such as age, income, occupation, and state.
+Memory is session-isolated. Eligibility is intentionally conservative:
+clear numeric mismatches can be reported, while unparsed criteria produce
+`INSUFFICIENT_INFORMATION`; the system never labels a person officially approved.
+
+Language detection supports English, Devanagari Hindi, and common Roman Hindi/Hinglish
+markers. Query expansion adds a small bilingual vocabulary while preserving the
+original query. The notebook's `all-MiniLM-L6-v2` model is English-centric and is not
+reliable for general cross-language Hindi↔English retrieval. A smoke calibration using
+the current PDF scored a relevant English query at 0.619, its Hindi-expanded equivalent
+at 0.532, and an unrelated PM-KISAN query at 0.45. The 0.5 threshold is provisional
+and must be retuned when the indexed corpus changes. For stronger multilingual
+retrieval, evaluate `paraphrase-multilingual-MiniLM-L12-v2`, `intfloat/multilingual-e5-base`,
+or `BAAI/bge-m3` on a representative test set, set `EMBEDDING_MODEL`, then rebuild the
+entire index. A model change is not applied silently.
+
+## Tests and deployment
+
+```powershell
+python -m pytest -q
+python scripts/test_rag.py "What documents are required for PM Kisan?"
+```
+
+For deployment, run an ASGI server such as `uvicorn app.main:app --host 0.0.0.0
+--port 8000` from `backend/`, provide secrets through the platform's secret manager,
+mount persistent storage for `backend/data/`, and configure exact frontend CORS
+origins. Use an authenticated reverse proxy or add user authentication before
+exposing session-management endpoints publicly.
+
+## Current limitations
+
+- OCR for scanned PDFs and automatic table reconstruction are not implemented.
+- `all-MiniLM-L6-v2` remains the compatible default; multilingual expansion is
+  vocabulary-based and does not replace multilingual embeddings.
+- The 0.5 similarity threshold has only a small smoke-test calibration; validate it
+  against a labeled retrieval set for the full document corpus.
+- Grounding checks validate citations and critical numbers, but do not perform full
+  semantic entailment.
+- Eligibility evaluation intentionally declines to confirm likely eligibility when
+  criteria are incomplete or not recognized by deterministic parsers.
+- MongoDB availability is required for session and metadata endpoints when a
+  `MONGODB_URI` is configured; the service returns an explicit unavailable error if
+  that configured database cannot be reached.

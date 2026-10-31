@@ -1,8 +1,10 @@
 .env
-.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-vector_store/
-data/conversations.sqlite3*
-data/pdfs/managed/
+.coverage
+data/processed/*.sqlite3
+data/processed/*.sqlite3-*
+data/vector_store/*
+!data/vector_store/.gitkeep
+!data/processed/.gitkeep

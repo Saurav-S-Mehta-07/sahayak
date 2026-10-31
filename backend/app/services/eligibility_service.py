@@ -1,183 +1,140 @@
-"""Eligibility evaluation against administrator-reviewed documentary criteria."""
-
 from __future__ import annotations
 
-import json
-import operator
 import re
 from typing import Any
 
-from ..database import connect
+from app.models.schemas import EligibilityProfile, EligibilityResult
+from app.rag.citation_manager import CitationManager
+from app.rag.context_builder import ContextBuilder
+from app.rag.retriever import Retriever
+from app.utils.text_utils import slugify
 
-_COMPARATORS = {
-    "eq": operator.eq,
-    "ne": operator.ne,
-    "gte": operator.ge,
-    "lte": operator.le,
-}
+_AGE_RANGE = re.compile(
+    r"(?:\b(?:age|aged)\s*(?:group\s*)?(?:between|from)?\s*(\d{1,3})\s*(?:to|-|and)\s*(\d{1,3})\b"
+    r"|\bbetween\s*(\d{1,3})\s*(?:to|-|and)\s*(\d{1,3})\s*(?:years?\s*)?(?:of\s*age)?\b)",
+    re.IGNORECASE,
+)
+_AGE_MINIMUM = re.compile(r"\b(?:minimum age|at least|aged)\D{0,20}(\d{1,3})\b", re.I)
+_AGE_MAXIMUM = re.compile(r"\b(?:maximum age|not more than|below age|up to age)\D{0,20}(\d{1,3})\b", re.I)
+_INCOME_LIMIT = re.compile(
+    r"(?:annual|family|household)?\s*income[^\n]{0,60}?"
+    r"(?:not exceed|not more than|less than|up to|below|maximum|limit)"
+    r"\s*(?:of\s*)?(?:₹|rs\.?\s*)?([\d,]{4,})"
+    r"|(?:₹|rs\.?\s*)?([\d,]{4,})[^\n]{0,40}?"
+    r"(?:annual|family|household)?\s*income[^\n]{0,30}?"
+    r"(?:limit|maximum|not exceed)",
+    re.IGNORECASE,
+)
 
 
-def _compare(actual: Any, comparator: str, expected: Any) -> bool | None:
-    if comparator in {"gte", "lte"}:
-        try:
-            actual_number = float(actual)
-            expected_number = float(expected)
-        except (TypeError, ValueError):
-            return None
-        return bool(_COMPARATORS[comparator](actual_number, expected_number))
-    if comparator == "in":
-        if not isinstance(expected, list):
-            return None
-        return str(actual).casefold() in {
-            str(value).casefold() for value in expected
-        }
-    if comparator == "contains":
-        if not isinstance(actual, (list, str)):
-            return None
-        if isinstance(actual, list):
-            return str(expected).casefold() in {
-                str(value).casefold() for value in actual
-            }
-        return str(expected).casefold() in actual.casefold()
-    if comparator in {"eq", "ne"}:
-        return bool(
-            _COMPARATORS[comparator](
-                str(actual).casefold(), str(expected).casefold()
-            )
+class EligibilityService:
+    """Conservative evaluator; unsupported or unparsed scheme rules stay unresolved."""
+
+    def __init__(self, retriever: Retriever, context_builder: ContextBuilder | None = None):
+        self.retriever = retriever
+        self.context_builder = context_builder or ContextBuilder()
+
+    def evaluate(
+        self,
+        scheme_id: str,
+        profile: EligibilityProfile,
+        scheme_name: str | None = None,
+    ) -> EligibilityResult:
+        query = (
+            f"{scheme_id} eligibility beneficiary criteria qualification age income "
+            "occupation exclusions land ownership documents application"
         )
-    return None
+        results = self.retriever.retrieve(
+            [query], scheme_id=slugify(scheme_id), top_k=8
+        )
+        evidence = self.context_builder.build(results)
+        display_name = (
+            str(results[0]["metadata"].get("scheme_name"))
+            if results
+            else scheme_name or scheme_id
+        )
+        matched: list[str] = []
+        unmatched: list[str] = []
+        missing: list[str] = []
+        recognized = 0
+        criteria_text = "\n".join(item.content for item in evidence)
 
+        for match in _AGE_RANGE.finditer(criteria_text):
+            recognized += 1
+            lower = int(match.group(1) or match.group(3))
+            upper = int(match.group(2) or match.group(4))
+            if profile.age is None:
+                missing.append(f"age (documented range: {lower}–{upper})")
+            elif lower <= profile.age <= upper:
+                matched.append(f"Age is within the documented range {lower}–{upper}")
+            else:
+                unmatched.append(f"Age does not meet the documented range {lower}–{upper}")
 
-def evaluate_scheme(scheme_id: str, answers: dict[str, Any]) -> dict[str, Any]:
-    with connect() as connection:
-        scheme = connection.execute(
-            "SELECT id, name FROM schemes WHERE id = ?", (scheme_id,)
-        ).fetchone()
-        if scheme is None:
-            raise LookupError("Scheme not found.")
-        rows = connection.execute(
-            """
-            SELECT criteria.*, documents.filename, documents.source_url
-            FROM scheme_eligibility_criteria AS criteria
-            JOIN scheme_documents AS documents
-              ON documents.id = criteria.source_document_id
-            WHERE criteria.scheme_id = ?
-              AND documents.verification_status = 'verified'
-              AND documents.indexing_status = 'indexed'
-            ORDER BY criteria.id
-            """,
-            (scheme_id,),
-        ).fetchall()
-    if not rows:
-        return {
-            "scheme_id": scheme_id,
-            "scheme_name": scheme["name"],
-            "status": "more_information_required",
-            "message": (
-                "No administrator-reviewed eligibility criteria linked to a "
-                "verified, indexed document are available for this scheme."
-            ),
-            "criteria": [],
-        }
+        for match in _AGE_MINIMUM.finditer(criteria_text):
+            recognized += 1
+            minimum = int(match.group(1))
+            if profile.age is None:
+                missing.append(f"age (minimum {minimum})")
+            elif profile.age >= minimum:
+                matched.append(f"Age meets the documented minimum {minimum}")
+            else:
+                unmatched.append(f"Age is below the documented minimum {minimum}")
 
-    criteria_results: list[dict[str, Any]] = []
-    for row in rows:
-        expected = json.loads(row["expected_value_json"])
-        actual = answers.get(row["field_key"])
-        if actual is None:
-            status = "unknown"
+        for match in _AGE_MAXIMUM.finditer(criteria_text):
+            recognized += 1
+            maximum = int(match.group(1))
+            if profile.age is None:
+                missing.append(f"age (maximum {maximum})")
+            elif profile.age <= maximum:
+                matched.append(f"Age meets the documented maximum {maximum}")
+            else:
+                unmatched.append(f"Age exceeds the documented maximum {maximum}")
+
+        for match in _INCOME_LIMIT.finditer(criteria_text):
+            recognized += 1
+            raw_limit = match.group(1) or match.group(2)
+            limit = int(raw_limit.replace(",", ""))
+            snippet = criteria_text[max(0, match.start() - 30) : match.end() + 30].lower()
+            if profile.annual_income is None:
+                missing.append(f"annual income (documented value: {limit})")
+            elif any(term in snippet for term in ("maximum", "not exceed", "below", "up to", "limit")):
+                if profile.annual_income <= limit:
+                    matched.append(f"Annual income is within the documented limit {limit}")
+                else:
+                    unmatched.append(f"Annual income exceeds the documented limit {limit}")
+            else:
+                missing.append("the meaning of the documented income amount")
+
+        if not evidence:
+            missing.append("indexed scheme eligibility information")
+        if evidence and re.search(r"\beligib(?:le|ility)|beneficiar", criteria_text, re.I):
+            missing.append("scheme-specific non-numeric criteria and exclusions")
+        if not recognized and evidence:
+            missing.append("explicit, machine-readable eligibility criteria")
+
+        if unmatched:
+            status = "LIKELY_NOT_ELIGIBLE"
+            explanation = (
+                "At least one provided detail does not meet a clearly documented "
+                "criterion. This is a preliminary indication, not an official decision."
+            )
         else:
-            matched = _compare(actual, row["operator"], expected)
-            status = (
-                "unknown" if matched is None else "satisfied" if matched else "not_satisfied"
+            status = "INSUFFICIENT_INFORMATION"
+            explanation = (
+                "The indexed documents do not provide enough structured criteria to "
+                "confirm likely eligibility. Unparsed or scheme-specific conditions "
+                "must be checked against the cited source."
             )
-        criteria_results.append(
-            {
-                "field": row["field_key"],
-                "description": row["description"],
-                "status": status,
-                "provided_value": actual,
-                "expected": expected,
-                "operator": row["operator"],
-                "source": {
-                    "filename": row["filename"],
-                    "page": row["source_page"],
-                    "excerpt": row["source_excerpt"],
-                    "url": row["source_url"],
-                },
-            }
+
+        citation_answer = " ".join(f"[{item.citation_id}]" for item in evidence)
+        citations = CitationManager.citations(evidence, citation_answer)
+        return EligibilityResult(
+            scheme_name=display_name,
+            status=status,
+            matched_criteria=matched,
+            unmatched_criteria=unmatched,
+            missing_information=list(dict.fromkeys(missing)),
+            explanation=explanation,
+            citations=citations,
+            disclaimer="This is guidance based only on indexed documents, not official approval or a guarantee of benefits.",
         )
-
-    statuses = {criterion["status"] for criterion in criteria_results}
-    if "not_satisfied" in statuses:
-        outcome = "not_eligible_based_on_provided_information"
-    elif "unknown" in statuses:
-        outcome = "more_information_required"
-    else:
-        outcome = "potentially_eligible"
-    return {
-        "scheme_id": scheme_id,
-        "scheme_name": scheme["name"],
-        "status": outcome,
-        "message": (
-            "This is a preliminary comparison with recorded criteria only; it "
-            "is not an official eligibility decision or guarantee."
-        ),
-        "criteria": criteria_results,
-    }
-
-
-def recommend_schemes(answers: dict[str, Any]) -> dict[str, Any]:
-    """Recommend only schemes with verified documentary criteria and a full match."""
-    with connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT DISTINCT schemes.id
-            FROM schemes
-            JOIN scheme_eligibility_criteria AS criteria
-              ON criteria.scheme_id = schemes.id
-            JOIN scheme_documents AS documents
-              ON documents.id = criteria.source_document_id
-            WHERE documents.verification_status = 'verified'
-              AND documents.indexing_status = 'indexed'
-            ORDER BY schemes.name
-            """
-        ).fetchall()
-    evaluations = [evaluate_scheme(row["id"], answers) for row in rows]
-    matches = [
-        {
-            "scheme_id": result["scheme_id"],
-            "scheme_name": result["scheme_name"],
-            "criteria": result["criteria"],
-            "message": result["message"],
-        }
-        for result in evaluations
-        if result["status"] == "potentially_eligible"
-    ]
-    return {
-        "recommendations": matches,
-        "requires_more_information": not evaluations or any(
-            result["status"] == "more_information_required" for result in evaluations
-        ),
-        "evaluated_schemes": len(evaluations),
-        "message": (
-            "Recommendations are limited to schemes whose recorded, "
-            "document-linked criteria match the information provided."
-        ),
-    }
-
-
-def validate_criterion_excerpt(excerpt: str) -> str:
-    excerpt = " ".join(excerpt.split())
-    if len(excerpt) < 12:
-        raise ValueError("Provide a source excerpt that supports this criterion.")
-    if len(excerpt) > 2000:
-        raise ValueError("The source excerpt must be at most 2,000 characters.")
-    return excerpt
-
-
-def normalize_field_key(value: str) -> str:
-    key = re.sub(r"[^a-z0-9_]+", "_", value.casefold()).strip("_")
-    if not key or len(key) > 64:
-        raise ValueError("Field key must contain 1 to 64 letters, numbers, or underscores.")
-    return key
